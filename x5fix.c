@@ -18,6 +18,8 @@ PG_MODULE_MAGIC;
 Datum
 add_entry_gp_persistent_filespace_node(PG_FUNCTION_ARGS);
 
+static HTAB *persistentFilespaceSharedHashTable = NULL;
+
 typedef struct FilespaceDirEntryKey
 {
 	Oid	filespaceOid;
@@ -44,11 +46,94 @@ typedef FilespaceDirEntryData *FilespaceDirEntry;
 
 PG_FUNCTION_INFO_V1(add_entry_gp_persistent_filespace_node);
 
+static bool
+PersistentFilespace_HashTableInit(void)
+{
+	HASHCTL			info;
+	int				hash_flags;
+
+	/* Set key and entry sizes. */
+	MemSet(&info, 0, sizeof(info));
+	info.keysize = sizeof(FilespaceDirEntryKey);
+	info.entrysize = sizeof(FilespaceDirEntryData);
+	info.hash = tag_hash;
+	hash_flags = (HASH_ELEM | HASH_FUNCTION);
+
+	persistentFilespaceSharedHashTable =
+						ShmemInitHash("Persistent Filespace Hash",
+								   gp_max_filespaces,
+								   gp_max_filespaces,
+								   &info,
+								   hash_flags);
+
+	if (persistentFilespaceSharedHashTable == NULL)
+		return false;
+
+	return true;
+}
+
+static FilespaceDirEntry
+PersistentFilespace_FindDirUnderLock(
+	Oid			filespaceOid)
+{
+	bool			found;
+
+	FilespaceDirEntry	filespaceDirEntry;
+
+	FilespaceDirEntryKey key;
+
+	Assert(LWLockHeldByMe(FilespaceHashLock));
+
+	if (persistentFilespaceSharedHashTable == NULL)
+		elog(PANIC, "Persistent filespace information shared-memory not setup");
+
+	key.filespaceOid = filespaceOid;
+
+	filespaceDirEntry =
+			(FilespaceDirEntry)
+					hash_search(persistentFilespaceSharedHashTable,
+								(void *) &key,
+								HASH_FIND,
+								&found);
+	if (!found)
+		return NULL;
+
+	return filespaceDirEntry;
+}
+
+static void PersistentFilespace_BlankPadCopyLocation(
+	char locationBlankPadded[FilespaceLocationBlankPaddedWithNullTermLen],
+	char *location)
+{
+	int len;
+	int blankPadLen;
+
+	if (location != NULL)
+	{
+		len = strlen(location);
+		if (len > FilespaceLocationBlankPaddedWithNullTermLen - 1)
+			elog(ERROR, "Location '%s' is too long (found %d characaters -- expected no more than %d characters)",
+				 location,
+			     len,
+			     FilespaceLocationBlankPaddedWithNullTermLen - 1);
+	}
+	else
+		len = 0;
+
+	if (len > 0)
+		memcpy(locationBlankPadded, location, len);
+
+	blankPadLen = FilespaceLocationBlankPaddedWithNullTermLen - 1 - len;
+	if (blankPadLen > 0)
+		MemSet(&locationBlankPadded[len], ' ', blankPadLen);
+
+	locationBlankPadded[FilespaceLocationBlankPaddedWithNullTermLen - 1] = '\0';
+}
+
 Datum
 add_entry_gp_persistent_filespace_node(PG_FUNCTION_ARGS)
 {
     FilespaceDirEntry fde;
-    PersistentFileSysObjName fsObjName;
     Oid filespace;
     int16 p_dbid;
     char *p_path;
@@ -64,15 +149,11 @@ add_entry_gp_persistent_filespace_node(PG_FUNCTION_ARGS)
 
     WRITE_PERSISTENT_STATE_ORDERED_LOCK_DECLARE;
 
-	if (Persistent_BeforePersistenceWork())
-		elog(ERROR, "persistent table changes forbidden");
-	PersistentFilespace_VerifyInitScan();
-	PersistentFileSysObjName_SetFilespaceDir(&fsObjName, filespace);
-
 	WRITE_PERSISTENT_STATE_ORDERED_LOCK;
     LWLockAcquire(FilespaceHashLock, LW_SHARED);
 
-    // set filespaceOid
+    PersistentFilespace_HashTableInit();
+
     fde = PersistentFilespace_FindDirUnderLock(filespace);
     if (fde == NULL)
         elog(ERROR, "did not find persistent filespace entry %u", filespace);
