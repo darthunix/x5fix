@@ -1,0 +1,4 @@
+comment = 'x5fix'
+default_version = '0.1'
+module_pathname = '$libdir/x5fix'
+relocatable = true
